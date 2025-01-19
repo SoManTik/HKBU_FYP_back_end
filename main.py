@@ -8,14 +8,10 @@ from bson.objectid import ObjectId
 import json
 import os
 from PyPDF2 import PdfFileReader
-# import numpy as np
 import requests
-# from bs4 import BeautifulSoup
-import joblib
 from utils.T5_generate_summary import T5_model_generate_summary
 from utils.BART_generate_summary import Bart_model_generate_summary
 from utils.Fake_news_detection import detect_fake_news
-from utils.news_type_detection_n_recommendation.news_recommendation_ import  custom_tokenizer
 from utils.news_type_detection_n_recommendation.news_recommendation_ import  get_recommendations
 app = Flask(__name__)
 
@@ -37,7 +33,8 @@ def login():
     if(user==None):
         return jsonify({"message": "Authentication failed","user":False}),401
     _id = ObjectId(str(user["_id"]))
-    data = {"_id": _id}
+    user_type = user["user_type"]
+    data = {"_id": _id, "user_type": user_type}
     data = json.dumps(data, default=str)
     access_token = create_access_token(identity=data)
     return jsonify(user=True,access_token=access_token),200
@@ -135,6 +132,25 @@ def upload_file():
         # Return error message for invalid file type
         return jsonify({"error": "Invalid file type"}), 400
 
+@app.route("/api/accout_creation", methods=["POST"])
+def accout_creation():
+    data = request.get_json()
+    data = data['account_info']
+    collection = db.connectCollection("user")
+    response = collection.insert_one({
+        "email": data['email'],
+        "pwd": data['pwd'],
+        "user_type": data['selected_user_type'],
+        "gender":data['gender'],
+        "job":data['job'],
+        "birth_date":data['birth_date'],
+        "phone_number":data['phone_number'],
+        'name':data['name'],
+        'agree':data['agree']==True,
+        'country':data['country'],
+    })
+    data = json.dumps(response, default=str)
+    return jsonify(data=data), 200
 
 
 if __name__ == '__main__':
