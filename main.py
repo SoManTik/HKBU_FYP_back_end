@@ -12,7 +12,7 @@ import requests
 from utils.T5_generate_summary import T5_model_generate_summary
 from utils.BART_generate_summary import Bart_model_generate_summary
 from utils.Fake_news_detection import detect_fake_news
-from utils.news_type_detection_n_recommendation.news_recommendation_ import  get_recommendations
+from utils.news_type_detection_n_recommendation.news_recommendation_ import  get_recommendations, custom_tokenizer
 app = Flask(__name__)
 
 
@@ -47,17 +47,16 @@ def T5_generate_summary():
 
     summary = T5_model_generate_summary(selected_text, temperature= temperature)
     probability, detection = detect_fake_news(unseen_news_text=summary)
-    news_recommendation_url, news_recommendation_img, news_recommendation_title = get_recommendations(summary)
+    top10_relevant_news = get_recommendations(summary)
     
-    response = requests.get(news_recommendation_img)
 
-    news_recommendation_img = response.url
-    print(news_recommendation_img)
     summary = json.dumps(summary, default=str)
+    top10_relevant_news = json.dumps(top10_relevant_news, default=str)
+
     return jsonify(summary=summary, probability=int(probability*100),
-                  news_recommendation_url = news_recommendation_url,
-                    news_recommendation_img = news_recommendation_img,
-                    news_recommendation_title = news_recommendation_title,
+                 
+                    top10_relevant_news = top10_relevant_news,
+            
                     detection=detection), 200
 
 @app.route("/api/BART_generate_summary",methods=['GET', 'POST'])
@@ -131,13 +130,51 @@ def upload_file():
     else:
         # Return error message for invalid file type
         return jsonify({"error": "Invalid file type"}), 400
+    
+
+@app.route("/api/find_user_email", methods=["GET","POST"])
+def find_user_email():
+    data = request.get_json()
+    user_account_type = data['selected_user_type']
+    collection = db.connectCollection("user")
+
+    if  data['selected_user_type'] == "deletion":
+        results = list(collection.find({}))
+        results = json.dumps(results,default=str)
+        print(" results",results)
+        return jsonify({'users_data':results}), 200
+
+ 
+    
+    results = list(collection.find({"user_type": user_account_type}))
+ 
+
+    emails = [result["email"] for result in results]
+    emails = json.dumps(emails,default=str)
+    results = json.dumps(results,default=str)
+  
+
+    if results:
+        return jsonify({"emails": emails, 'users_data':results}), 200
+    else:
+        return jsonify({"message": "User not found"}), 400
+
+
+
 
 @app.route("/api/accout_creation", methods=["POST"])
 def accout_creation():
     data = request.get_json()
+    if data is None:
+        return jsonify({"message": "No data provided"}), 400
     data = data['account_info']
     collection = db.connectCollection("user")
-    response = collection.insert_one({
+
+    result = collection.find_one({"email": data['email']})
+    if result:
+        return jsonify({"message": "Email already exists"}), 400
+
+    result = collection.insert_one({
         "email": data['email'],
         "pwd": data['pwd'],
         "user_type": data['selected_user_type'],
@@ -149,8 +186,47 @@ def accout_creation():
         'agree':data['agree']==True,
         'country':data['country'],
     })
-    data = json.dumps(response, default=str)
-    return jsonify(data=data), 200
+    if result.acknowledged:
+        return jsonify({"message": "Account created successfully"}), 200
+
+@app.route("/api/account_modification", methods=["POST"])
+def account_modification():
+    data = request.get_json()
+    if data is None:
+        return jsonify({"message": "No data provided"}), 400
+    data = data['account_info']
+    collection = db.connectCollection("user")
+    # Update a single record
+    filter_query = {'email': data['email']}
+    update_data = {'$set': {
+        "email": data['email'],
+        "pwd": data['pwd'],
+        "user_type": data['user_type'],
+        "gender":data['gender'],
+        "job":data['job'],
+        "birth_date":data['birth_date'],
+        "phone_number":data['phone_number'],
+        'name':data['name'],
+        'country':data['country'],
+    }}
+    result = collection.update_one(filter_query, update_data)
+    if result.acknowledged:
+        return jsonify({"message": "Account updated successfully"}), 200
+
+@app.route("/api/account_deletion", methods=["POST"])
+def account_deletion():
+    data = request.get_json()
+    data = data['selectedItems_for_deleting']
+    data = [record['Email'] for record in data]
+    
+    collection = db.connectCollection("user")
+    result = collection.delete_many({'email': {'$in': data}})
+
+
+    return jsonify({"message": "Account updated successfully"}), 200
+
+    
+
 
 
 if __name__ == '__main__':
