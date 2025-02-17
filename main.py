@@ -1,19 +1,40 @@
 from flask import Flask, request, jsonify, Response
-# from config import Config
 from flask_cors import CORS
 import utils.db as db
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from datetime import timedelta
+from flask_sse import sse
+from datetime import timedelta, datetime
 from bson.objectid import ObjectId
 import json
 import os
 from PyPDF2 import PdfFileReader
 import requests
+import nltk
+import ssl
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
+nltk.download('stopwords')
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
+
 from utils.T5_generate_summary import T5_model_generate_summary
 from utils.BART_generate_summary import Bart_model_generate_summary
 from utils.Fake_news_detection import detect_fake_news
+from utils.Llama3_generate_summar import Llama3_model_generate_summary
+from moviepy import VideoFileClip
+import whisper
+
+
 from utils.news_type_detection_n_recommendation.news_recommendation_ import  get_recommendations, custom_tokenizer
 app = Flask(__name__)
+app.config["REDIS_URL"] = "redis://localhost:6379/0"
+app.register_blueprint(sse, url_prefix='/stream')
+
 
 
 
@@ -41,11 +62,42 @@ def login():
 
 @app.route("/api/T5_generate_summary",methods=['GET', 'POST'])
 def T5_generate_summary():
+    grade =3
+    collection= db.connectCollection("news_summary")
+
     data = request.get_json()
     selected_text = data.get('selectedText', '')
     temperature = data.get('temperature')
 
     summary = T5_model_generate_summary(selected_text, temperature= temperature)
+    probability, detection = detect_fake_news(unseen_news_text=summary)
+    top10_relevant_news, prediction_news_type = get_recommendations(summary)
+    
+    summary = json.dumps(summary, default=str)
+    top10_relevant_news = json.dumps(top10_relevant_news, default=str)
+
+    result = collection.insert_one({
+        "grade":grade,
+        "summary":summary,
+        "model": "T5",
+        "news_type": prediction_news_type,
+        "title":"",
+        "fake_news_probability":probability,
+        "date_time":datetime.now()
+    })
+    return jsonify(summary=summary, probability=int(probability*100),
+                 
+                    top10_relevant_news = top10_relevant_news,
+            
+                    detection=detection), 200
+
+@app.route("/api/Llama3_generate_summary",methods=['GET', 'POST'])
+def Llama3_generate_summary():
+    data = request.get_json()
+    selected_text = data.get('selectedText', '')
+    temperature = data.get('temperature')
+
+    summary = Llama3_model_generate_summary(selected_text, temperature= temperature)
     probability, detection = detect_fake_news(unseen_news_text=summary)
     top10_relevant_news = get_recommendations(summary)
     
@@ -59,6 +111,7 @@ def T5_generate_summary():
             
                     detection=detection), 200
 
+
 @app.route("/api/BART_generate_summary",methods=['GET', 'POST'])
 def Bart_generate_summary():
     data = request.get_json()
@@ -67,18 +120,13 @@ def Bart_generate_summary():
 
     summary = Bart_model_generate_summary(selected_text, temperature= temperature)
     probability, detection = detect_fake_news(unseen_news_text=summary)
-    news_recommendation_url, news_recommendation_img, news_recommendation_title = get_recommendations( summary)
-    # 
-    response = requests.get(news_recommendation_img)
-
-    #
-    news_recommendation_img = response.url
-
+    top10_relevant_news = get_recommendations( summary)
+    
     summary = json.dumps(summary, default=str)
+    top10_relevant_news = json.dumps(top10_relevant_news, default=str)
+
     return jsonify(summary=summary, probability=int(probability*100),
-                  news_recommendation_url = news_recommendation_url,
-                    news_recommendation_img = news_recommendation_img,
-                    news_recommendation_title = news_recommendation_title,
+                    top10_relevant_news = top10_relevant_news,
                     detection=detection), 200
 
 @app.route('/get-url', methods=['POST'])
@@ -100,6 +148,44 @@ def scrape():
         return jsonify({'content': response.text})
     except requests.RequestException as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route("/api/upload_video_file", methods=["POST"])
+def upload_video_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if file:
+        # Save the file to a temporary location
+        temp_video_path = os.path.join('/tmp', file.filename)
+        file.save(temp_video_path)
+
+        # Extract audio from video
+        video = VideoFileClip(temp_video_path)
+        temp_audio_path = temp_video_path.replace('.mp4', '.wav')
+        video.audio.write_audiofile(temp_audio_path)
+
+        # Use Whisper to get the transcript
+        model = whisper.load_model("base")
+        result = model.transcribe(temp_audio_path)
+        transcript = result['text']
+
+        # Clean up temporary files
+        os.remove(temp_video_path)
+        os.remove(temp_audio_path)
+
+        return jsonify({'transcript': transcript})
+
+    return jsonify({'error': 'File upload failed'}), 500
+
+
+
+
+
+
 
 @app.route("/api/upload_file", methods=["POST"])
 def upload_file():
