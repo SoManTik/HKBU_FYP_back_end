@@ -60,35 +60,88 @@ def login():
     access_token = create_access_token(identity=data)
     return jsonify(user=True,access_token=access_token),200
 
-@app.route("/api/T5_generate_summary",methods=['GET', 'POST'])
+
+@app.route("/api/udate_rating",methods=['GET', 'POST'])
+def udate_rating():
+    collection= db.connectCollection("news_summary")
+
+    data = request.get_json()
+    grade = data.get('rating', '')
+    currebt_id = data.get('currebt_id', '')
+    print(currebt_id)
+    result = collection.update_one(
+    {"_id": ObjectId(currebt_id)},  # filter to find the document to update
+    {
+        "$set": {  # update operator
+            "grade": grade,
+        }
+    })
+    if result.matched_count == 1 and result.modified_count == 1:
+        print("Update successful")
+    return jsonify(msg="rating is updated"), 200
+
+
+@app.route("/api/T5_generate_summary",methods=['GET', 'POST'])  
+@jwt_required()
 def T5_generate_summary():
-    grade =3
+    grade =2.5
     collection= db.connectCollection("news_summary")
 
     data = request.get_json()
     selected_text = data.get('selectedText', '')
     temperature = data.get('temperature')
+    currebt_id =  data.get('currebt_id')
+  
 
+    user_id = get_jwt_identity()
+    user_id = json.loads(user_id)["_id"]
+    
+    # user_id = user_id.get()
+    
     summary = T5_model_generate_summary(selected_text, temperature= temperature)
     probability, detection = detect_fake_news(unseen_news_text=summary)
     top10_relevant_news, prediction_news_type = get_recommendations(summary)
     
     summary = json.dumps(summary, default=str)
     top10_relevant_news = json.dumps(top10_relevant_news, default=str)
+    if currebt_id is None:
+        result = collection.insert_one({
+            "grade":grade,
+            "summary":summary,
+            "model": "T5",
+            "user_id":ObjectId(user_id),
+            "news_type": prediction_news_type,
+            "title":"",
+            "fake_news_probability":probability,
+            "date_time":datetime.now()
+        })
+        currebt_id = result.inserted_id
+        currebt_id = json.dumps(currebt_id, default=str)
+    
+    else:
+        print(currebt_id)
+        result = collection.update_one(
+        {"_id": ObjectId(currebt_id)},  # filter to find the document to update
+        {
+        "$set": { 
+            "grade":grade,
+            "summary":summary,
+            "model": "T5",
+            "user_id":ObjectId(user_id),
+            "news_type": prediction_news_type,
+            "title":"",
+            "fake_news_probability":probability,
+            "date_time":datetime.now()}
+        })
+      
+        currebt_id = json.dumps(currebt_id, default=str)
+    
 
-    result = collection.insert_one({
-        "grade":grade,
-        "summary":summary,
-        "model": "T5",
-        "news_type": prediction_news_type,
-        "title":"",
-        "fake_news_probability":probability,
-        "date_time":datetime.now()
-    })
+   
+
     return jsonify(summary=summary, probability=int(probability*100),
-                 
+                 inserted_id=currebt_id,
                     top10_relevant_news = top10_relevant_news,
-            
                     detection=detection), 200
 
 @app.route("/api/Llama3_generate_summary",methods=['GET', 'POST'])
@@ -110,6 +163,232 @@ def Llama3_generate_summary():
                     top10_relevant_news = top10_relevant_news,
             
                     detection=detection), 200
+
+
+@app.route("/api/pie_chart",methods=['GET', 'POST'])
+@jwt_required()
+def pie_chart():
+    user_info = get_jwt_identity()
+    user_type = json.loads(user_info)["user_type"]
+    user_id = json.loads(user_info)["_id"]
+    data = request.get_json()
+    target_year = data.get('selected_year', '')
+
+    collection= db.connectCollection("news_summary")
+
+    result=""
+
+    if user_type =="System administrator":
+        result = collection.aggregate([
+            {
+            "$match": {"$expr": {
+                "$eq": [
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+
+
+            },
+            },
+            {
+                '$group': {
+                    '_id':{ 'grade': '$grade', },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                    '_id.grade': 1,
+                      
+             }
+            }
+        ])
+    else:
+        result = collection.aggregate([
+            {
+            "$match": {
+                "user_id": ObjectId(user_id),
+                "$expr": {
+                "$eq": [
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+            },
+            },
+            {
+            '$group': {
+                    '_id':{ 'grade': '$grade', },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                        '_id.grade': 1,
+            }
+            }
+        ])
+
+    result = list(result)  # store the result in a variable
+    
+    print("result",result)
+    transformed_result = []
+
+    for entry in result:
+        grade = entry['_id']['grade']
+        count = entry['count']
+        transformed_result.append({'_id': grade, 'count': count})
+
+
+    if transformed_result:  # check if the result is not empty
+        ids, counts = map(list, zip(*[(float(item['_id']), item['count']) for item in transformed_result]))
+    else:
+        ids, counts = [], []
+
+
+    ids = [f"{item}" +" Star" for item in ids ]
+    print(ids)  
+    print(counts) 
+    ids = json.dumps(ids,default=list)
+    counts = json.dumps(counts,default=list)
+
+
+
+    result = collection.aggregate([
+        {
+            '$group': {
+                '_id': {
+                    '$year': '$date_time'
+                }
+            }
+        },
+        {
+            '$sort': {'_id': 1}
+        }
+    ])
+
+    # Extract the years from the aggregation result
+    available_years = [entry['_id'] for entry in result]
+    available_years = json.dumps(available_years,default=list)
+    print(available_years,"available_years")
+
+
+    return jsonify(counts=counts,ids=ids, available_years=available_years), 200
+
+
+
+@app.route("/api/line_chart",methods=['GET', 'POST'])
+@jwt_required()
+def line_chart():
+    user_info = get_jwt_identity()
+
+    data = request.get_json()
+    target_year = data.get('selected_year', '')
+    user_type = json.loads(user_info)["user_type"]
+    user_id = json.loads(user_info)["_id"]
+    
+    collection= db.connectCollection("news_summary")
+    result=""
+    if user_type =="System administrator":
+        result = collection.aggregate([
+            {
+            "$match": {"$expr": {
+                "$eq": [
+
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+
+
+            },
+            },
+            {
+                '$group': {
+                    '_id':{ 'grade': '$grade', 
+                           'date_time':{
+                                '$dateToString': {
+                                    'format': f'%Y-%m',
+                                    'date': '$date_time'
+                                }
+                           }
+                           },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                        '_id.grade': 1,
+                      '_id.date_time': 1
+                      }
+            }
+        ])
+    else:
+        result = collection.aggregate([
+              {
+            "$match": {
+                "user_id": ObjectId(user_id),
+                "$expr": {
+                "$eq": [
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+            },
+            },
+            {
+            '$group': {
+                    '_id':{ 'grade': '$grade', 
+                           'date_time':{
+                                '$dateToString': {
+                                    'format': f'%Y-%m',
+                                    'date': '$date_time'
+                                }
+                           }
+                           },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                '_id.grade': 1,
+                '_id.date_time': 1
+
+            }
+            }
+        ])
+
+    result_list = list(result)  # store the result in a variable
+
+    # Transforming the result
+    transformed_result = {}
+
+    for entry in result_list:
+        grade = entry['_id']['grade']
+        date_time = entry['_id']['date_time']
+        count = entry['count']
+        
+        if grade not in transformed_result:
+            transformed_result[grade] = {
+                "name": f"{grade}",
+                "data": []
+            }
+        
+        transformed_result[grade]['data'].append([date_time, count])
+
+    # Convert the dictionary to a list
+    final_result = list(transformed_result.values())
+
+    print(final_result)
+    final_result = json.dumps(final_result,default=list)
+
+    return jsonify(data=final_result), 200
+
+
+
+
+
 
 
 @app.route("/api/BART_generate_summary",methods=['GET', 'POST'])
