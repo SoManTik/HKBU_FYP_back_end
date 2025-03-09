@@ -1,5 +1,7 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response,send_file
 from flask_cors import CORS
+import io
+
 import utils.db as db
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from flask_sse import sse
@@ -7,6 +9,7 @@ from datetime import timedelta, datetime
 from bson.objectid import ObjectId
 import json
 import os
+import pandas as pd
 from PyPDF2 import PdfFileReader
 import requests
 import nltk
@@ -34,6 +37,7 @@ from utils.news_type_detection_n_recommendation.news_recommendation_ import  get
 app = Flask(__name__)
 app.config["REDIS_URL"] = "redis://localhost:6379/0"
 app.register_blueprint(sse, url_prefix='/stream')
+
 
 
 
@@ -68,7 +72,7 @@ def udate_rating():
     data = request.get_json()
     grade = data.get('rating', '')
     currebt_id = data.get('currebt_id', '')
-    print(currebt_id)
+ 
     result = collection.update_one(
     {"_id": ObjectId(currebt_id)},  # filter to find the document to update
     {
@@ -119,7 +123,549 @@ def T5_generate_summary():
         currebt_id = json.dumps(currebt_id, default=str)
     
     else:
-        print(currebt_id)
+    
+        result = collection.update_one(
+        {"_id": ObjectId(currebt_id)},  # filter to find the document to update
+        {
+        "$set": { 
+            "grade":grade,
+            "summary":summary,
+            "model": "T5",
+            "user_id":ObjectId(user_id),
+            "news_type": prediction_news_type,
+            "title":"",
+            "fake_news_probability":probability,
+            "date_time":datetime.now()}
+        })
+      
+        currebt_id = json.dumps(currebt_id, default=str)
+    
+
+    return jsonify(summary=summary, probability=int(probability*100),
+                 inserted_id=currebt_id,
+                    top10_relevant_news = top10_relevant_news,
+                    detection=detection), 200
+
+@app.route("/api/Llama3_generate_summary",methods=['GET', 'POST'])
+@jwt_required()
+def Llama3_generate_summary():
+    grade =2.5
+    collection= db.connectCollection("news_summary")
+
+    data = request.get_json()
+    selected_text = data.get('selectedText', '')
+    temperature = data.get('temperature')
+    currebt_id =  data.get('currebt_id')
+
+    user_id = get_jwt_identity()
+    user_id = json.loads(user_id)["_id"]
+
+    summary = Llama3_model_generate_summary(selected_text, temperature= temperature)
+    probability, detection = detect_fake_news(unseen_news_text=summary)
+    top10_relevant_news ,prediction_news_type= get_recommendations(summary)
+    
+
+    summary = json.dumps(summary, default=str)
+    top10_relevant_news = json.dumps(top10_relevant_news, default=str)
+
+
+
+    if currebt_id is None:
+        result = collection.insert_one({
+            "grade":grade,
+            "summary":summary,
+            "model": "T5",
+            "user_id":ObjectId(user_id),
+            "news_type": prediction_news_type,
+            "title":"",
+            "fake_news_probability":probability,
+            "date_time":datetime.now()
+        })
+        currebt_id = result.inserted_id
+        currebt_id = json.dumps(currebt_id, default=str)
+    
+    else:
+        
+        result = collection.update_one(
+        {"_id": ObjectId(currebt_id)},  # filter to find the document to update
+        {
+        "$set": { 
+            "grade":grade,
+            "summary":summary,
+            "model": "T5",
+            "user_id":ObjectId(user_id),
+            "news_type": prediction_news_type,
+            "title":"",
+            "fake_news_probability":probability,
+            "date_time":datetime.now()}
+        })
+        currebt_id = json.dumps(currebt_id, default=str)
+    
+
+
+
+    return jsonify(summary=summary, probability=int(probability*100),
+                 inserted_id=currebt_id,
+                    top10_relevant_news = top10_relevant_news,
+                    detection=detection), 200
+
+
+
+@app.route("/api/pie_chart",methods=['GET', 'POST'])
+@jwt_required()
+def pie_chart():
+    user_info = get_jwt_identity()
+    user_type = json.loads(user_info)["user_type"]
+    feature = {
+        "Summary Quality Grade":"grade",
+        "News Type":"news_type", 
+        "Fake News and Real News Detection":"fake_news_probability"
+    }
+    
+    user_id = json.loads(user_info)["_id"]
+    data = request.get_json()
+    target_year = data.get('selected_year', '')
+    selected_feature = feature[data.get('selected_feature', '')]
+    collection= db.connectCollection("news_summary")
+    result=""
+
+    if user_type =="System administrator" and selected_feature != "fake_news_probability":
+        result = collection.aggregate([
+            {
+            "$match": {"$expr": {
+                "$eq": [
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+
+
+            },
+            },
+            {
+                '$group': {
+                    '_id':{ selected_feature: f"${selected_feature}", },  
+                    'count': {'$sum': 1}
+
+            }
+            },
+            {
+            '$sort': {
+                    '_id.grade': 1,
+                      
+             }
+            }
+        ])
+    elif user_type !="System administrator" and selected_feature != "fake_news_probability":
+        result = collection.aggregate([
+            {
+            "$match": {
+                "user_id": ObjectId(user_id),
+                "$expr": {
+                "$eq": [
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+            },
+            },
+            {
+            '$group': {
+                 '_id':{ selected_feature: f"${selected_feature}", },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                        '_id.grade': 1,
+            }
+            }
+        ])
+    elif user_type =="System administrator" and selected_feature == "fake_news_probability":
+        result = collection.aggregate([
+            {
+                "$match": {
+                    "$expr": {
+                        "$eq": [
+                            {"$year": "$date_time"},
+                            target_year
+                        ]
+                    }
+                }
+            },
+            {
+                '$addFields': {
+                    'fake_news_probability': {
+                        '$cond': {
+                            'if': {'$gt': ['$fake_news_probability', 0.5]},
+                            'then': 'fake news',
+                            'else': 'real news'
+                        }
+                    }
+                }
+            },
+            {
+                '$group': {
+                    '_id': '$fake_news_probability',
+                    'count': {'$sum': 1}
+                }
+            },
+            {
+                '$sort': {'_id': 1}
+            }
+        ])
+    elif user_type !="System administrator" and selected_feature == "fake_news_probability":
+        result = collection.aggregate([
+            {
+                "$match": {
+                    "user_id": ObjectId(user_id),
+                    "$expr": {
+                        "$eq": [
+                            {"$year": "$date_time"},
+                            target_year
+                        ]
+                    }
+                }
+            },
+            {
+                '$addFields': {
+                    'fake_news_probability': {
+                        '$cond': {
+                            'if': {'$gt': ['$fake_news_probability', 0.5]},
+                            'then': 'fake news',
+                            'else': 'real news'
+                        }
+                    }
+                }
+            },
+            {
+                '$group': {
+                    '_id': '$fake_news_probability',
+                    'count': {'$sum': 1}
+                }
+            },
+            {
+                '$sort': {'_id': 1}
+            }
+        ])
+    result = list(result)  # store the result in a variable
+    
+    
+    transformed_result = []
+
+    for entry in result:
+        feature = entry['_id']
+        if selected_feature == "fake_news_probability":
+            feature = entry['_id']
+        else:
+            feature = entry['_id'][selected_feature]
+        count = entry['count']
+        transformed_result.append({'_id': feature, 'count': count})
+
+
+    if transformed_result:  # check if the result is not empty
+        ids, counts = map(list, zip(*[(item['_id'], item['count']) for item in transformed_result]))
+    else:
+        ids, counts = [], []
+
+    if selected_feature == "grade":
+        ids = [f"{item}" +" Star" for item in ids ]
+
+    
+    ids = json.dumps(ids,default=list)
+    counts = json.dumps(counts,default=list)
+
+
+
+    result = collection.aggregate([
+        {
+            '$group': {
+                '_id': {
+                    '$year': '$date_time'
+                }
+            }
+        },
+        {
+            '$sort': {'_id': 1}
+        }
+    ])
+
+    # Extract the years from the aggregation result
+    available_years = [entry['_id'] for entry in result]
+    available_years = json.dumps(available_years,default=list)
+  
+    return jsonify(counts=counts,ids=ids, available_years=available_years), 200
+
+
+
+@app.route("/api/line_chart",methods=['GET', 'POST'])
+@jwt_required()
+def line_chart():
+    user_info = get_jwt_identity()
+    feature = {
+            "Summary Quality Grade":"grade",
+            "News Type":"news_type", 
+            "Fake News and Real News Detection":"fake_news_probability"
+        }
+    data = request.get_json()
+    target_year = data.get('selected_year', '')
+    selected_feature = feature[data.get('selected_feature', '')]
+    user_type = json.loads(user_info)["user_type"]
+    user_id = json.loads(user_info)["_id"]
+    
+    
+    collection= db.connectCollection("news_summary")
+    result=""
+    if user_type =="System administrator" and selected_feature != "fake_news_probability":
+        result = collection.aggregate([
+            {
+            "$match": {"$expr": {
+                "$eq": [
+
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+            },
+            },
+            {
+                '$group': {
+                    '_id':{ selected_feature: f"${selected_feature}", 
+                           'date_time':{
+                                '$dateToString': {
+                                    'format': f'%Y-%m',
+                                    'date': '$date_time'
+                                }
+                           }
+                           },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                        f'_id': 1,
+                    #   '_id.date_time': 1
+                      }
+            }
+        ])
+    elif user_type !="System administrator" and selected_feature != "fake_news_probability":
+        result = collection.aggregate([
+              {
+            "$match": {
+                "user_id": ObjectId(user_id),
+                "$expr": {
+                "$eq": [
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+            },
+            },
+            {
+            '$group': {
+                 '_id':{ selected_feature: f"${selected_feature}", 
+                           'date_time':{
+                                '$dateToString': {
+                                    'format': f'%Y-%m',
+                                    'date': '$date_time'
+                                }
+                           }
+                           },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                 f'_id': 1,
+                # '_id.date_time': 1
+
+            }
+            }
+        ])
+    elif user_type =="System administrator" and selected_feature == "fake_news_probability":
+        result = collection.aggregate([
+            {
+            "$match": {"$expr": {
+                "$eq": [
+
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+            },
+            },
+                     {
+                '$addFields': {
+                    'fake_news_probability': {
+                        '$cond': {
+                            'if': {'$gt': ['$fake_news_probability', 0.5]},
+                            'then': 'fake news',
+                            'else': 'real news'
+                        }
+                    }
+                }
+            },
+            {
+                '$group': {
+                    '_id':{ "fake_news_probability": "$fake_news_probability", 
+                           'date_time':{
+                                '$dateToString': {
+                                    'format': f'%Y-%m',
+                                    'date': '$date_time'
+                                }
+                           }
+                           },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                        f'_id': 1,
+                    #   '_id.date_time': 1
+                      }
+            }
+        ])
+    elif user_type !="System administrator" and selected_feature == "fake_news_probability":
+        result = collection.aggregate([
+            {
+            "$match": {
+            "user_id": ObjectId(user_id),
+                "$expr": {
+                "$eq": [
+
+                    {"$year": "$date_time"},
+                    target_year
+                ]
+            }
+            },
+            },
+                     {
+                '$addFields': {
+                    'fake_news_probability': {
+                        '$cond': {
+                            'if': {'$gt': ['$fake_news_probability', 0.5]},
+                            'then': 'fake news',
+                            'else': 'real news'
+                        }
+                    }
+                }
+            },
+            {
+                '$group': {
+                    '_id':{ "fake_news_probability": "$fake_news_probability", 
+                           'date_time':{
+                                '$dateToString': {
+                                    'format': f'%Y-%m',
+                                    'date': '$date_time'
+                                }
+                           }
+                           },  
+                    'count': {'$sum': 1}
+            }
+            },
+            {
+            '$sort': {
+                        f'_id': 1,
+                    #   '_id.date_time': 1
+                      }
+            }
+        ])
+        
+           
+    result_list = list(result)  # store the result in a variable
+  
+
+    transformed_result = {}
+
+    for entry in result_list:
+   
+        item = entry['_id'][selected_feature]
+        date_time = entry['_id']['date_time']
+        count = entry['count']
+        
+        if item not in transformed_result:
+            if selected_feature == "grade":
+                item = f"{item} " +" Star"
+            transformed_result[item] = {
+                "name": f"{item}",
+                "data": []
+            }
+        
+        transformed_result[item]['data'].append([date_time, count])
+
+    # Convert the dictionary to a list
+    final_result = list(transformed_result.values())
+
+  
+    final_result = json.dumps(final_result,default=list)
+
+    return jsonify(data=final_result), 200
+
+@app.route("/api/Download_excel",methods=['GET', 'POST'])
+@jwt_required()
+def Download_excel():
+    collection= db.connectCollection("news_summary")
+    # Fetch documents from the collection
+    documents = collection.find()
+
+    # Convert documents to a DataFrame
+    df = pd.DataFrame(list(documents))
+    
+    # Drop the MongoDB ObjectId column if not needed
+    if '_id' in df.columns:
+        df.drop('_id', axis=1, inplace=True)
+
+    # Save the DataFrame to an Excel file in memory
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+        writer.close()  
+    output.seek(0)
+
+    # Send the Excel file as a response
+    return send_file(output, download_name='output.xlsx', as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+
+
+
+@app.route("/api/BART_generate_summary",methods=['GET', 'POST'])
+@jwt_required()
+def Bart_generate_summary():
+    grade =2.5
+    collection= db.connectCollection("news_summary")
+
+    data = request.get_json()
+    selected_text = data.get('selectedText', '')
+    temperature = data.get('temperature')
+    currebt_id =  data.get('currebt_id')
+
+    user_id = get_jwt_identity()
+    user_id = json.loads(user_id)["_id"]
+    
+
+    summary = Bart_model_generate_summary(selected_text, temperature= temperature)
+    probability, detection = detect_fake_news(unseen_news_text=summary)
+    top10_relevant_news, prediction_news_type = get_recommendations(summary)
+    
+    summary = json.dumps(summary, default=str)
+    top10_relevant_news = json.dumps(top10_relevant_news, default=str)
+    if currebt_id is None:
+        result = collection.insert_one({
+            "grade":grade,
+            "summary":summary,
+            "model": "T5",
+            "user_id":ObjectId(user_id),
+            "news_type": prediction_news_type,
+            "title":"",
+            "fake_news_probability":probability,
+            "date_time":datetime.now()
+        })
+        currebt_id = result.inserted_id
+        currebt_id = json.dumps(currebt_id, default=str)
+    
+    else:
+        
         result = collection.update_one(
         {"_id": ObjectId(currebt_id)},  # filter to find the document to update
         {
@@ -144,269 +690,6 @@ def T5_generate_summary():
                     top10_relevant_news = top10_relevant_news,
                     detection=detection), 200
 
-@app.route("/api/Llama3_generate_summary",methods=['GET', 'POST'])
-def Llama3_generate_summary():
-    data = request.get_json()
-    selected_text = data.get('selectedText', '')
-    temperature = data.get('temperature')
-
-    summary = Llama3_model_generate_summary(selected_text, temperature= temperature)
-    probability, detection = detect_fake_news(unseen_news_text=summary)
-    top10_relevant_news = get_recommendations(summary)
-    
-
-    summary = json.dumps(summary, default=str)
-    top10_relevant_news = json.dumps(top10_relevant_news, default=str)
-
-    return jsonify(summary=summary, probability=int(probability*100),
-                 
-                    top10_relevant_news = top10_relevant_news,
-            
-                    detection=detection), 200
-
-
-@app.route("/api/pie_chart",methods=['GET', 'POST'])
-@jwt_required()
-def pie_chart():
-    user_info = get_jwt_identity()
-    user_type = json.loads(user_info)["user_type"]
-    user_id = json.loads(user_info)["_id"]
-    data = request.get_json()
-    target_year = data.get('selected_year', '')
-
-    collection= db.connectCollection("news_summary")
-
-    result=""
-
-    if user_type =="System administrator":
-        result = collection.aggregate([
-            {
-            "$match": {"$expr": {
-                "$eq": [
-                    {"$year": "$date_time"},
-                    target_year
-                ]
-            }
-
-
-            },
-            },
-            {
-                '$group': {
-                    '_id':{ 'grade': '$grade', },  
-                    'count': {'$sum': 1}
-            }
-            },
-            {
-            '$sort': {
-                    '_id.grade': 1,
-                      
-             }
-            }
-        ])
-    else:
-        result = collection.aggregate([
-            {
-            "$match": {
-                "user_id": ObjectId(user_id),
-                "$expr": {
-                "$eq": [
-                    {"$year": "$date_time"},
-                    target_year
-                ]
-            }
-            },
-            },
-            {
-            '$group': {
-                    '_id':{ 'grade': '$grade', },  
-                    'count': {'$sum': 1}
-            }
-            },
-            {
-            '$sort': {
-                        '_id.grade': 1,
-            }
-            }
-        ])
-
-    result = list(result)  # store the result in a variable
-    
-    print("result",result)
-    transformed_result = []
-
-    for entry in result:
-        grade = entry['_id']['grade']
-        count = entry['count']
-        transformed_result.append({'_id': grade, 'count': count})
-
-
-    if transformed_result:  # check if the result is not empty
-        ids, counts = map(list, zip(*[(float(item['_id']), item['count']) for item in transformed_result]))
-    else:
-        ids, counts = [], []
-
-
-    ids = [f"{item}" +" Star" for item in ids ]
-    print(ids)  
-    print(counts) 
-    ids = json.dumps(ids,default=list)
-    counts = json.dumps(counts,default=list)
-
-
-
-    result = collection.aggregate([
-        {
-            '$group': {
-                '_id': {
-                    '$year': '$date_time'
-                }
-            }
-        },
-        {
-            '$sort': {'_id': 1}
-        }
-    ])
-
-    # Extract the years from the aggregation result
-    available_years = [entry['_id'] for entry in result]
-    available_years = json.dumps(available_years,default=list)
-    print(available_years,"available_years")
-
-
-    return jsonify(counts=counts,ids=ids, available_years=available_years), 200
-
-
-
-@app.route("/api/line_chart",methods=['GET', 'POST'])
-@jwt_required()
-def line_chart():
-    user_info = get_jwt_identity()
-
-    data = request.get_json()
-    target_year = data.get('selected_year', '')
-    user_type = json.loads(user_info)["user_type"]
-    user_id = json.loads(user_info)["_id"]
-    
-    collection= db.connectCollection("news_summary")
-    result=""
-    if user_type =="System administrator":
-        result = collection.aggregate([
-            {
-            "$match": {"$expr": {
-                "$eq": [
-
-                    {"$year": "$date_time"},
-                    target_year
-                ]
-            }
-
-
-            },
-            },
-            {
-                '$group': {
-                    '_id':{ 'grade': '$grade', 
-                           'date_time':{
-                                '$dateToString': {
-                                    'format': f'%Y-%m',
-                                    'date': '$date_time'
-                                }
-                           }
-                           },  
-                    'count': {'$sum': 1}
-            }
-            },
-            {
-            '$sort': {
-                        '_id.grade': 1,
-                      '_id.date_time': 1
-                      }
-            }
-        ])
-    else:
-        result = collection.aggregate([
-              {
-            "$match": {
-                "user_id": ObjectId(user_id),
-                "$expr": {
-                "$eq": [
-                    {"$year": "$date_time"},
-                    target_year
-                ]
-            }
-            },
-            },
-            {
-            '$group': {
-                    '_id':{ 'grade': '$grade', 
-                           'date_time':{
-                                '$dateToString': {
-                                    'format': f'%Y-%m',
-                                    'date': '$date_time'
-                                }
-                           }
-                           },  
-                    'count': {'$sum': 1}
-            }
-            },
-            {
-            '$sort': {
-                '_id.grade': 1,
-                '_id.date_time': 1
-
-            }
-            }
-        ])
-
-    result_list = list(result)  # store the result in a variable
-
-    # Transforming the result
-    transformed_result = {}
-
-    for entry in result_list:
-        grade = entry['_id']['grade']
-        date_time = entry['_id']['date_time']
-        count = entry['count']
-        
-        if grade not in transformed_result:
-            transformed_result[grade] = {
-                "name": f"{grade}",
-                "data": []
-            }
-        
-        transformed_result[grade]['data'].append([date_time, count])
-
-    # Convert the dictionary to a list
-    final_result = list(transformed_result.values())
-
-    print(final_result)
-    final_result = json.dumps(final_result,default=list)
-
-    return jsonify(data=final_result), 200
-
-
-
-
-
-
-
-@app.route("/api/BART_generate_summary",methods=['GET', 'POST'])
-def Bart_generate_summary():
-    data = request.get_json()
-    selected_text = data.get('selectedText', '')
-    temperature = data.get('temperature')
-
-    summary = Bart_model_generate_summary(selected_text, temperature= temperature)
-    probability, detection = detect_fake_news(unseen_news_text=summary)
-    top10_relevant_news = get_recommendations( summary)
-    
-    summary = json.dumps(summary, default=str)
-    top10_relevant_news = json.dumps(top10_relevant_news, default=str)
-
-    return jsonify(summary=summary, probability=int(probability*100),
-                    top10_relevant_news = top10_relevant_news,
-                    detection=detection), 200
 
 @app.route('/get-url', methods=['POST'])
 def get_url():
@@ -462,10 +745,6 @@ def upload_video_file():
 
 
 
-
-
-
-
 @app.route("/api/upload_file", methods=["POST"])
 def upload_file():
 
@@ -506,7 +785,7 @@ def find_user_email():
     if  data['selected_user_type'] == "deletion":
         results = list(collection.find({}))
         results = json.dumps(results,default=str)
-        print(" results",results)
+        
         return jsonify({'users_data':results}), 200
 
  
@@ -591,7 +870,50 @@ def account_deletion():
     return jsonify({"message": "Account updated successfully"}), 200
 
     
+@app.route("/api/data_table",methods=['GET', 'POST'])
+@jwt_required()
+def data_table():
+    user_info = get_jwt_identity()
+    user_type = json.loads(user_info)["user_type"]
+    user_id = json.loads(user_info)["_id"]
+    collection= db.connectCollection("news_summary")
+    result=""
+    if user_type =="System administrator":
+        result = collection.aggregate([
+            {
+            "$match": {}
+            },
+            {
+            '$addFields': {
+                    'fake_news_detection': {
+                        '$cond': {
+                            'if': {'$gt': ['$fake_news_probability', 0.5]},
+                            'then': 'fake news',
+                            'else': 'real news'
+                        }
+                    }
+                }
+            }
 
+        ])
+    # else:
+    #     result = collection.find({"user_id": ObjectId(user_id)})
+
+    result = list(result)
+    reformatted_data = []
+    
+    for item in list(result):
+       
+        reformatted_data.append({
+            # "Title": item.get("title", ""),
+            "News Summary": item.get("summary", ""),
+            "Fake news detection": "It may be "+item.get("fake_news_detection", ""),
+            "Grade": str(item.get("grade", ""))
+        })
+  
+
+    reformatted_data = json.dumps(reformatted_data,default=str)
+    return jsonify(result=reformatted_data), 200
 
 
 if __name__ == '__main__':
